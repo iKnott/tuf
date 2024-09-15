@@ -1,37 +1,45 @@
 # Copyright 2021, New York University and the TUF contributors
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
-"""Provides an implementation of FetcherInterface using the Requests HTTP
-  library.
+"""Provides an implementation of ``FetcherInterface`` using the Requests HTTP
+library.
 """
 
+# requests_fetcher is public but comes from _internal for now (because
+# sigstore-python 1.0 still uses the module from there). requests_fetcher
+# can be moved out of _internal once sigstore-python 1.0 is not relevant.
+
 import logging
-import time
-from typing import Iterator, Optional
+from typing import Dict, Iterator, Optional, Tuple
 from urllib import parse
 
 # Imports
 import requests
-import urllib3.exceptions
 
 import tuf
-from tuf import exceptions
+from tuf.api import exceptions
 from tuf.ngclient.fetcher import FetcherInterface
 
 # Globals
 logger = logging.getLogger(__name__)
 
+
 # Classes
 class RequestsFetcher(FetcherInterface):
-    """A concrete implementation of FetcherInterface based on the Requests
-    library.
+    """An implementation of ``FetcherInterface`` based on the requests library.
 
     Attributes:
-        _sessions: A dictionary of Requests.Session objects storing a separate
-            session per scheme+hostname combination.
+        socket_timeout: Timeout in seconds, used for both initial connection
+            delay and the maximum delay between bytes received.
+        chunk_size: Chunk size in bytes used when downloading.
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        socket_timeout: int = 30,
+        chunk_size: int = 400000,
+        app_user_agent: Optional[str] = None,
+    ) -> None:
         # http://docs.python-requests.org/en/master/user/advanced/#session-objects:
         #
         # "The Session object allows you to persist certain parameters across
@@ -46,30 +54,26 @@ class RequestsFetcher(FetcherInterface):
         # improve efficiency, but avoiding sharing state between different
         # hosts-scheme combinations to minimize subtle security issues.
         # Some cookies may not be HTTP-safe.
-        self._sessions = {}
+        self._sessions: Dict[Tuple[str, str], requests.Session] = {}
 
         # Default settings
-        self.socket_timeout: int = 4  # seconds
-        self.chunk_size: int = 400000  # bytes
-        self.sleep_before_round: Optional[int] = None
+        self.socket_timeout: int = socket_timeout  # seconds
+        self.chunk_size: int = chunk_size  # bytes
+        self.app_user_agent = app_user_agent
 
-    def fetch(self, url: str, max_length: int) -> Iterator[bytes]:
-        """Fetches the contents of HTTP/HTTPS url from a remote server.
+    def _fetch(self, url: str) -> Iterator[bytes]:
+        """Fetch the contents of HTTP/HTTPS url from a remote server.
 
-        Ensures the length of the downloaded data is up to 'max_length'.
-
-        Arguments:
-            url: A URL string that represents a file location.
-            max_length: An integer value representing the maximum
-                number of bytes to be downloaded.
+        Args:
+            url: URL string that represents a file location.
 
         Raises:
-            exceptions.SlowRetrievalError: A timeout occurs while receiving
+            exceptions.SlowRetrievalError: Timeout occurs while receiving
                 data.
-            exceptions.FetcherHTTPError: An HTTP error code is received.
+            exceptions.DownloadHTTPError: HTTP error code is received.
 
         Returns:
-            A bytes iterator
+            Bytes iterator
         """
         # Get a customized session for each new schema+hostname combination.
         session = self._get_session(url)
@@ -81,109 +85,68 @@ class RequestsFetcher(FetcherInterface):
         # requests as:
         #  - connect timeout (max delay before first byte is received)
         #  - read (gap) timeout (max delay between bytes received)
-        response = session.get(url, stream=True, timeout=self.socket_timeout)
+        try:
+            response = session.get(
+                url, stream=True, timeout=self.socket_timeout
+            )
+        except requests.exceptions.Timeout as e:
+            raise exceptions.SlowRetrievalError from e
+
         # Check response status.
         try:
             response.raise_for_status()
         except requests.HTTPError as e:
             response.close()
             status = e.response.status_code
-            raise exceptions.FetcherHTTPError(str(e), status)
+            raise exceptions.DownloadHTTPError(str(e), status) from e
 
-        return self._chunks(response, max_length)
+        return self._chunks(response)
 
-    def _chunks(
-        self, response: "requests.Response", max_length: int
-    ) -> Iterator[bytes]:
-        """A generator function to be returned by fetch. This way the
-        caller of fetch can differentiate between connection and actual data
-        download."""
+    def _chunks(self, response: "requests.Response") -> Iterator[bytes]:
+        """A generator function to be returned by fetch.
+
+        This way the caller of fetch can differentiate between connection
+        and actual data download.
+        """
 
         try:
-            bytes_received = 0
-            while True:
-                # We download a fixed chunk of data in every round. This is
-                # so that we can defend against slow retrieval attacks.
-                # Furthermore, we do not wish to download an extremely
-                # large file in one shot. Before beginning the round, sleep
-                # (if set) for a short amount of time so that the CPU is not
-                # hogged in the while loop.
-                if self.sleep_before_round:
-                    time.sleep(self.sleep_before_round)
-
-                read_amount = min(
-                    self.chunk_size,
-                    max_length - bytes_received,
-                )
-
-                # NOTE: This may not handle some servers adding a
-                # Content-Encoding header, which may cause urllib3 to
-                #  misbehave:
-                # https://github.com/pypa/pip/blob/404838abcca467648180b358598c597b74d568c9/src/pip/_internal/download.py#L547-L582
-                data = response.raw.read(read_amount)
-                bytes_received += len(data)
-
-                # We might have no more data to read. Check number of bytes
-                # downloaded.
-                if not data:
-                    # Finally, we signal that the download is complete.
-                    break
-
-                yield data
-
-                if bytes_received >= max_length:
-                    break
-
-            logger.debug(
-                "Downloaded %d out of %d bytes",
-                bytes_received,
-                max_length,
-            )
-
-        except urllib3.exceptions.ReadTimeoutError as e:
-            raise exceptions.SlowRetrievalError(str(e))
+            yield from response.iter_content(self.chunk_size)
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+        ) as e:
+            raise exceptions.SlowRetrievalError from e
 
         finally:
             response.close()
 
-    def _get_session(self, url):
-        """Returns a different customized requests.Session per schema+hostname
+    def _get_session(self, url: str) -> requests.Session:
+        """Return a different customized requests.Session per schema+hostname
         combination.
+
+        Raises:
+            exceptions.DownloadError: When there is a problem parsing the url.
         """
         # Use a different requests.Session per schema+hostname combination, to
         # reuse connections while minimizing subtle security issues.
         parsed_url = parse.urlparse(url)
 
-        if not parsed_url.scheme or not parsed_url.hostname:
-            raise exceptions.URLParsingError(
-                "Could not get scheme and hostname from URL: " + url
-            )
+        if not parsed_url.scheme:
+            raise exceptions.DownloadError(f"Failed to parse URL {url}")
 
-        session_index = parsed_url.scheme + "+" + parsed_url.hostname
+        session_index = (parsed_url.scheme, parsed_url.hostname or "")
         session = self._sessions.get(session_index)
 
         if not session:
             session = requests.Session()
             self._sessions[session_index] = session
 
-            # Attach some default headers to every Session.
-            requests_user_agent = session.headers["User-Agent"]
-            # Follows the RFC: https://tools.ietf.org/html/rfc7231#section-5.5.3
-            tuf_user_agent = (
-                "tuf/" + tuf.__version__ + " " + requests_user_agent
-            )
-            session.headers.update(
-                {
-                    # Tell the server not to compress or modify anything.
-                    # https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Accept-Encoding#Directives
-                    "Accept-Encoding": "identity",
-                    # The TUF user agent.
-                    "User-Agent": tuf_user_agent,
-                }
-            )
+            ua = f"python-tuf/{tuf.__version__} {session.headers['User-Agent']}"
+            if self.app_user_agent is not None:
+                ua = f"{self.app_user_agent} {ua}"
+            session.headers["User-Agent"] = ua
 
             logger.debug("Made new session %s", session_index)
-
         else:
             logger.debug("Reusing session %s", session_index)
 

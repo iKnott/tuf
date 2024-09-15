@@ -1,19 +1,18 @@
 # Copyright New York University and the TUF contributors
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
-"""TUF role metadata JSON serialization and deserialization.
-
-This module provides concrete implementations to serialize and deserialize TUF
-role metadata to and from the JSON wireline format for transportation, and
-to serialize the 'signed' part of TUF role metadata to the OLPC Canonical JSON
-format for signature generation and verification.
-
+"""``tuf.api.serialization.json`` module provides concrete implementations to
+serialize and deserialize TUF role metadata to and from the JSON wireline
+format for transportation, and to serialize the 'signed' part of TUF role
+metadata to the OLPC Canonical JSON format for signature generation and
+verification.
 """
+
 import json
+from typing import Optional
 
 from securesystemslib.formats import encode_canonical
 
-# pylint: disable=cyclic-import
 # ... to allow de/serializing Metadata and Signed objects here, while also
 # creating default de/serializers there (see metadata local scope imports).
 # NOTE: A less desirable alternative would be to add more abstraction layers.
@@ -36,8 +35,8 @@ class JSONDeserializer(MetadataDeserializer):
             json_dict = json.loads(raw_data.decode("utf-8"))
             metadata_obj = Metadata.from_dict(json_dict)
 
-        except Exception as e:  # pylint: disable=broad-except
-            raise DeserializationError from e
+        except Exception as e:
+            raise DeserializationError("Failed to deserialize JSON") from e
 
         return metadata_obj
 
@@ -45,17 +44,22 @@ class JSONDeserializer(MetadataDeserializer):
 class JSONSerializer(MetadataSerializer):
     """Provides Metadata to JSON serialize method.
 
-    Attributes:
+    Args:
         compact: A boolean indicating if the JSON bytes generated in
-                'serialize' should be compact by excluding whitespace.
+            'serialize' should be compact by excluding whitespace.
+        validate: Check that the metadata object can be deserialized again
+            without change of contents and thus find common mistakes.
+            This validation might slow down serialization significantly.
 
     """
 
-    def __init__(self, compact: bool = False) -> None:
+    def __init__(self, compact: bool = False, validate: Optional[bool] = False):
         self.compact = compact
+        self.validate = validate
 
     def serialize(self, metadata_obj: Metadata) -> bytes:
         """Serialize Metadata object into utf-8 encoded JSON bytes."""
+
         try:
             indent = None if self.compact else 1
             separators = (",", ":") if self.compact else (",", ": ")
@@ -66,8 +70,18 @@ class JSONSerializer(MetadataSerializer):
                 sort_keys=True,
             ).encode("utf-8")
 
-        except Exception as e:  # pylint: disable=broad-except
-            raise SerializationError from e
+            if self.validate:
+                try:
+                    new_md_obj = JSONDeserializer().deserialize(json_bytes)
+                    if metadata_obj != new_md_obj:
+                        raise ValueError(
+                            "Metadata changes if you serialize and deserialize."
+                        )
+                except Exception as e:
+                    raise ValueError("Metadata cannot be validated!") from e
+
+        except Exception as e:
+            raise SerializationError("Failed to serialize JSON") from e
 
         return json_bytes
 
@@ -83,7 +97,7 @@ class CanonicalJSONSerializer(SignedSerializer):
             signed_dict = signed_obj.to_dict()
             canonical_bytes = encode_canonical(signed_dict).encode("utf-8")
 
-        except Exception as e:  # pylint: disable=broad-except
+        except Exception as e:
             raise SerializationError from e
 
         return canonical_bytes

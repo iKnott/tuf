@@ -1,0 +1,113 @@
+name: CD
+concurrency: cd
+
+on:
+  push:
+    tags:
+      - v*
+
+permissions: {}
+
+jobs:
+  test:
+    uses: ./.github/workflows/_test.yml
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+        with:
+          ref: ${{ github.event.workflow_run.head_branch }}
+
+      - name: Set up Python
+        uses: actions/setup-python@f677139bbe7f9c59b41e40162b753c062f5d49a3 # v5.2.0
+        with:
+          python-version: '3.x'
+
+      - name: Install build dependency
+        run: python3 -m pip install --constraint requirements/build.txt build
+
+      - name: Build binary wheel, source tarball and changelog
+        run: |
+          PIP_CONSTRAINT=requirements/build.txt python3 -m build --sdist --wheel --outdir dist/ .
+          awk "/## $GITHUB_REF_NAME/{flag=1; next} /## v/{flag=0} flag" docs/CHANGELOG.md > changelog
+
+      - name: Store build artifacts
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874 # v4.4.0
+        with:
+          name: build-artifacts
+          path: |
+            dist
+            changelog
+
+  candidate_release:
+    name: Release candidate on Github for review
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: write # to modify GitHub releases
+    outputs:
+      release_id: ${{ steps.gh-release.outputs.result }}
+    steps:
+      - name: Fetch build artifacts
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: build-artifacts
+
+      - id: gh-release
+        name: Publish GitHub release draft
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            fs = require('fs')
+            res = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: '${{ github.ref_name }}-rc',
+              tag_name: '${{ github.ref }}',
+              body: fs.readFileSync('changelog', 'utf8'),
+            });
+
+            fs.readdirSync('dist/').forEach(file => {
+              github.rest.repos.uploadReleaseAsset({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                release_id: res.data.id,
+                name: file,
+                data: fs.readFileSync('dist/' + file),
+              });
+            });
+            return res.data.id
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: candidate_release
+    environment: release
+    permissions:
+      contents: write # to modify GitHub releases
+      id-token: write # to authenticate as Trusted Publisher to pypi.org
+    steps:
+      - name: Fetch build artifacts
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: build-artifacts
+
+      - name: Publish binary wheel and source tarball on PyPI
+        # Only attempt pypi upload in upstream repository
+        if: github.repository == 'theupdateframework/python-tuf'
+        uses: pypa/gh-action-pypi-publish@0ab0b79471669eb3a4d647e625009c62f9f3b241 # v1.10.1
+
+      - name: Finalize GitHub release
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: '${{ needs.candidate_release.outputs.release_id }}',
+              name: '${{ github.ref_name }}',
+            })
